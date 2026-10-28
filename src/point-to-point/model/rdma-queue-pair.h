@@ -8,9 +8,27 @@
 #include <ns3/event-id.h>
 #include <ns3/custom-header.h>
 #include <ns3/int-header.h>
+#include <ns3/callback.h>
+#include <ns3/nstime.h>
+#include <deque>
 #include <vector>
 
 namespace ns3 {
+
+class RdmaQueuePair;
+
+// One logical message posted on a persistent queue pair. Byte offsets are
+// cumulative over the lifetime of the QP: the message occupies
+// [begin, end) of the QP's sequence space. Unused in LEGACY mode, where a
+// QP carries exactly one message and completes with it.
+struct RdmaWorkRequest {
+	uint64_t msg_id;
+	uint64_t begin;
+	uint64_t end;
+	Time postTime;
+	Time firstTxTime; // zero until the first byte of this message is sent
+	RdmaWorkRequest() : msg_id(0), begin(0), end(0), postTime(0), firstTxTime(0) {}
+};
 
 class RdmaQueuePair : public Object {
 public:
@@ -81,6 +99,22 @@ public:
 		uint32_t m_incStage;
 	}hpccPint;
 
+	/******************************
+	 * persistent-connection state
+	 * (TRANSPORT_CONNECTION_MODE PERSISTENT). All of this is inert for a
+	 * legacy QP: m_persistent stays false and m_wrs stays empty.
+	 *****************************/
+	bool m_persistent;
+	uint64_t m_qp_id;    // backend-wide id, assigned at creation (both modes)
+	uint64_t m_conn_id;  // frontend connection id, 0 when not persistent
+	Time m_createTime;
+	uint64_t m_messages_posted;
+	uint64_t m_messages_completed;
+	uint64_t m_cnp_count;  // ACK/NACKs with the CNP flag seen by this QP
+	std::deque<RdmaWorkRequest> m_wrs; // posted, not yet fully acknowledged
+	// Invoked once per work request when snd_una reaches its end offset.
+	Callback<void, Ptr<RdmaQueuePair>, RdmaWorkRequest> m_notifyMsgComplete;
+
 	/***********
 	 * methods
 	 **********/
@@ -106,6 +140,14 @@ public:
 	uint64_t GetWin(); // window size calculated from m_rate
 	bool IsFinished();
 	uint64_t HpGetCurWin(); // window size calculated from hp.m_curRate, used by HPCC
+
+	// Persistent-connection helpers. PostWork appends a message of `bytes`
+	// to the QP's sequence space and returns the work request. NextWrBoundary
+	// returns the end offset of the message that contains byte `offset`, or
+	// m_size when no work request covers it.
+	RdmaWorkRequest PostWork(uint64_t msg_id, uint64_t bytes);
+	uint64_t NextWrBoundary(uint64_t offset);
+	bool HasPendingWork();
 };
 
 class RdmaRxQueuePair : public Object { // Rx side queue pair

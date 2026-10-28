@@ -12,8 +12,11 @@
 #include "ppp-header.h"
 #include "qbb-header.h"
 #include "cn-header.h"
+#include "rdma-cc-trace.h"
 
 namespace ns3{
+
+uint64_t RdmaHw::s_next_qp_id = 1;
 
 TypeId RdmaHw::GetTypeId (void)
 {
@@ -247,6 +250,22 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	m_qpMap[key] = qp;
 
 	// set init variables
+	InitQpState(qp, nic_idx);
+
+	// observational: id, counters, trace
+	qp->m_qp_id = s_next_qp_id++;
+	RdmaCounters::qps_created++;
+	RdmaCounters::messages_posted++;
+	if (RdmaCcTrace::On(1)){
+		RdmaCcTrace::Log("QP_CREATE", qp, size);
+		RdmaCcTrace::Log("MESSAGE_START", qp, size);
+	}
+
+	// Notify Nic
+	m_nic[nic_idx].dev->NewQp(qp);
+}
+
+void RdmaHw::InitQpState(Ptr<RdmaQueuePair> qp, uint32_t nic_idx){
 	DataRate m_bps = m_nic[nic_idx].dev->GetDataRate();
 	qp->m_rate = m_bps;
 	qp->m_max_rate = m_bps;
@@ -263,15 +282,108 @@ void RdmaHw::AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t si
 	}else if (m_cc_mode == 10){
 		qp->hpccPint.m_curRate = m_bps;
 	}
-
-	// Notify Nic
-	m_nic[nic_idx].dev->NewQp(qp);
 }
 
 void RdmaHw::DeleteQueuePair(Ptr<RdmaQueuePair> qp){
 	// remove qp from the m_qpMap
 	uint64_t key = GetQpKey(qp->dip.Get(), qp->sport, qp->m_pg);
 	m_qpMap.erase(key);
+}
+
+/******************************
+ * Persistent connections
+ *****************************/
+Ptr<RdmaQueuePair> RdmaHw::CreatePersistentQp(uint32_t src, uint32_t dest, uint16_t pg, Ipv4Address sip, Ipv4Address dip, uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt, uint64_t conn_id, Callback<void, Ptr<RdmaQueuePair>, RdmaWorkRequest> notifyMsgComplete){
+	uint64_t key = GetQpKey(dip.Get(), sport, pg);
+	NS_ASSERT_MSG(m_qpMap.find(key) == m_qpMap.end(), "CreatePersistentQp: (dip, sport, pg) already has a QP");
+	Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
+	qp->SetSrc(src);
+	qp->SetDest(dest);
+	qp->SetTag(0);
+	qp->SetSize(0);          // sequence space grows with each PostMessage
+	qp->SetInitialSize(0);
+	qp->SetWin(win);
+	qp->SetBaseRtt(baseRtt);
+	qp->SetVarWin(m_var_win);
+	qp->m_persistent = true;
+	qp->m_conn_id = conn_id;
+	qp->m_qp_id = s_next_qp_id++;
+	qp->m_notifyMsgComplete = notifyMsgComplete;
+
+	uint32_t nic_idx = GetNicIdxOfQp(qp);
+	m_nic[nic_idx].qpGrp->AddQp(qp);
+	m_qpMap[key] = qp;
+	InitQpState(qp, nic_idx);
+	RdmaCounters::qps_created++;
+	if (RdmaCcTrace::On(1))
+		RdmaCcTrace::Log("QP_CREATE", qp, 0);
+	// Same as NewQp for a fresh QP: nothing to send yet, m_nextAvail is 0.
+	return qp;
+}
+
+RdmaWorkRequest RdmaHw::PostMessage(Ptr<RdmaQueuePair> qp, uint64_t msg_id, uint64_t bytes){
+	NS_ASSERT_MSG(qp->m_persistent, "PostMessage on a non-persistent QP");
+	// SeqTsHeader carries a 32-bit sequence number. A connection whose
+	// cumulative byte count would wrap cannot be represented; fail loudly
+	// instead of corrupting the receiver's expected sequence.
+	if (qp->m_size + bytes > 0xffffffffULL){
+		fprintf(stderr, "PostMessage: connection %lu (qp %lu, %u->%u) would exceed the 32-bit "
+		        "sequence space (%lu + %lu bytes). Split the workload or use LEGACY mode.\n",
+		        (unsigned long)qp->m_conn_id, (unsigned long)qp->m_qp_id, qp->m_src, qp->m_dest,
+		        (unsigned long)qp->m_size, (unsigned long)bytes);
+		exit(1);
+	}
+	RdmaWorkRequest wr = qp->PostWork(msg_id, bytes);
+	RdmaCounters::messages_posted++;
+
+	// An idle persistent QP may have been compacted out of the NIC's
+	// round-robin list (GetNextQindex removes finished QPs). Put it back if
+	// so, without resetting its pacing state: m_nextAvail is kept, so a
+	// message posted immediately after another still honours the rate
+	// limiter's next send time.
+	uint32_t nic_idx = GetNicIdxOfQp(qp);
+	Ptr<RdmaQueuePairGroup> grp = m_nic[nic_idx].qpGrp;
+	bool present = false;
+	for (uint32_t i = 0; i < grp->GetN(); i++){
+		if (grp->Get(i) == qp){
+			present = true;
+			break;
+		}
+	}
+	if (!present)
+		grp->AddQp(qp);
+	if (RdmaCcTrace::On(1))
+		RdmaCcTrace::Log("MESSAGE_START", qp, msg_id);
+	m_nic[nic_idx].dev->TriggerTransmit();
+	return wr;
+}
+
+void RdmaHw::CompleteWorkRequests(Ptr<RdmaQueuePair> qp){
+	// Called after qp->Acknowledge(). Completes, in order, every work
+	// request whose last byte is now acknowledged. The QP itself stays.
+	while (!qp->m_wrs.empty() && qp->m_wrs.front().end <= qp->snd_una){
+		RdmaWorkRequest wr = qp->m_wrs.front();
+		qp->m_wrs.pop_front();
+		qp->m_messages_completed++;
+		RdmaCounters::messages_completed++;
+		if (RdmaCcTrace::On(1))
+			RdmaCcTrace::Log("MESSAGE_COMPLETE", qp, wr.msg_id);
+		if (!qp->m_notifyMsgComplete.IsNull())
+			qp->m_notifyMsgComplete(qp, wr);
+	}
+}
+
+void RdmaHw::DestroyPersistentQp(Ptr<RdmaQueuePair> qp){
+	if (m_cc_mode == 1){
+		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
+		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
+		Simulator::Cancel(qp->mlx.m_rpTimer);
+	}
+	RdmaCounters::qps_destroyed++;
+	if (RdmaCcTrace::On(1))
+		RdmaCcTrace::Log("QP_DESTROY", qp, qp->m_messages_completed);
+	DeleteQueuePair(qp);
+	// The NIC's round-robin list drops it on its next scan once IsFinished().
 }
 
 Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint16_t pg, bool create){
@@ -346,6 +458,8 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch){
 	if (ecnbits != 0){
 		rxQp->m_ecn_source.ecnbits |= ecnbits;
 		rxQp->m_ecn_source.qfb++;
+		if (RdmaCcTrace::On(2))
+			RdmaCcTrace::LogRx("ECN_RECEIVED", m_node->GetId(), ch.sip, ch.dip, ch.udp.sport, ch.udp.dport, ch.udp.seq);
 	}
 	rxQp->m_ecn_source.total++;
 	rxQp->m_milestone_rx = m_ack_interval;
@@ -457,7 +571,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 			uint32_t goback_seq = seq / m_chunk * m_chunk;
 			qp->Acknowledge(goback_seq);
 		}
-		if (qp->IsFinished()){
+		if (qp->m_persistent){
+			// Persistent QP: complete acknowledged messages, keep the QP.
+			CompleteWorkRequests(qp);
+		}else if (qp->IsFinished()){
 			QpComplete(qp);
 		}
 	}
@@ -466,6 +583,10 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch){
 
 	// handle cnp
 	if (cnp){
+		qp->m_cnp_count++;
+		RdmaCounters::cnp_acks++;
+		if (RdmaCcTrace::On(2))
+			RdmaCcTrace::Log("CNP_RECEIVED", qp, seq);
 		if (m_cc_mode == 1){ // mlx version
 			cnp_received_mlx(qp);
 		}
@@ -547,6 +668,14 @@ void RdmaHw::RecoverQueue(Ptr<RdmaQueuePair> qp){
 
 void RdmaHw::QpComplete(Ptr<RdmaQueuePair> qp){
 	NS_ASSERT(!m_qpCompleteCallback.IsNull());
+	// observational: the legacy QP carries exactly one message
+	qp->m_messages_completed++;
+	RdmaCounters::messages_completed++;
+	RdmaCounters::qps_destroyed++;
+	if (RdmaCcTrace::On(1)){
+		RdmaCcTrace::Log("MESSAGE_COMPLETE", qp, qp->m_size);
+		RdmaCcTrace::Log("QP_DESTROY", qp, 1);
+	}
 	if (m_cc_mode == 1){
 		Simulator::Cancel(qp->mlx.m_eventUpdateAlpha);
 		Simulator::Cancel(qp->mlx.m_eventDecreaseRate);
@@ -598,6 +727,22 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp){
 	uint32_t payload_size = qp->GetBytesLeft();
 	if (m_mtu < payload_size)
 		payload_size = m_mtu;
+	if (qp->m_persistent){
+		// Do not pack bytes of two logical messages into one packet: a work
+		// request's last packet may be short, as it would be on a real QP.
+		uint64_t boundary = qp->NextWrBoundary(qp->snd_nxt);
+		if (boundary > qp->snd_nxt && boundary - qp->snd_nxt < payload_size)
+			payload_size = boundary - qp->snd_nxt;
+		// observational: first transmission time of the message
+		for (auto &wr : qp->m_wrs){
+			if (wr.begin == qp->snd_nxt && wr.firstTxTime.IsZero()){
+				wr.firstTxTime = Simulator::Now();
+				break;
+			}
+			if (wr.begin > qp->snd_nxt)
+				break;
+		}
+	}
 	Ptr<Packet> p = Create<Packet> (payload_size);
 	// add SeqTsHeader
 	SeqTsHeader seqTs;
@@ -722,6 +867,8 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q){
 		#if PRINT_LOG
 		printf("(%.3lf %.3lf)\n", q->mlx.m_targetRate.GetBitRate() * 1e-9, q->m_rate.GetBitRate() * 1e-9);
 		#endif
+		if (RdmaCcTrace::On(1))
+			RdmaCcTrace::Log("RATE_DECREASE", q, 0);
 	}
 }
 void RdmaHw::ScheduleDecreaseRateMlx(Ptr<RdmaQueuePair> q, uint32_t delta){
@@ -732,6 +879,8 @@ void RdmaHw::RateIncEventTimerMlx(Ptr<RdmaQueuePair> q){
 	q->mlx.m_rpTimer = Simulator::Schedule(MicroSeconds(m_rpgTimeReset), &RdmaHw::RateIncEventTimerMlx, this, q);
 	RateIncEventMlx(q);
 	q->mlx.m_rpTimeStage++;
+	if (RdmaCcTrace::On(1))
+		RdmaCcTrace::Log("RATE_INCREASE", q, q->mlx.m_rpTimeStage);
 }
 void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q){
 	// check which increase phase: fast recovery, active increase, hyper increase
@@ -952,6 +1101,8 @@ void RdmaHw::UpdateRateHp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &ch
 					}
 				}
 			}
+			if (updated_any && RdmaCcTrace::On(fast_react ? 2 : 1))
+				RdmaCcTrace::Log(fast_react ? "HPCC_FAST_REACT" : "HPCC_UPDATE", qp, (uint64_t)(qp->hp.u * 1e6));
 		}
 		if (!fast_react){
 			if (next_seq > qp->hp.m_lastUpdateSeq)
@@ -1030,6 +1181,8 @@ void RdmaHw::UpdateRateTimely(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader
 			printf(" %c %.3lf\n", inc? '^':'v', qp->m_rate.GetBitRate() * 1e-9);
 		}
 		#endif
+		if (!us && RdmaCcTrace::On(1))
+			RdmaCcTrace::Log(inc ? "RATE_INCREASE" : "RATE_DECREASE", qp, rtt);
 	}
 	if (!us && next_seq > qp->tmly.m_lastUpdateSeq){
 		qp->tmly.m_lastUpdateSeq = next_seq;
@@ -1090,11 +1243,16 @@ void RdmaHw::HandleAckDctcp(Ptr<RdmaQueuePair> qp, Ptr<Packet> p, CustomHeader &
 		#endif
 		qp->dctcp.m_caState = 1;
 		qp->dctcp.m_highSeq = qp->snd_nxt;
+		if (RdmaCcTrace::On(1))
+			RdmaCcTrace::Log("RATE_DECREASE", qp, (uint64_t)(qp->dctcp.m_alpha * 1e6));
 	}
 
 	// additive inc
-	if (qp->dctcp.m_caState == 0 && new_batch)
+	if (qp->dctcp.m_caState == 0 && new_batch){
 		qp->m_rate = std::min(qp->m_max_rate, qp->m_rate + m_dctcp_rai);
+		if (RdmaCcTrace::On(1))
+			RdmaCcTrace::Log("RATE_INCREASE", qp, (uint64_t)(qp->dctcp.m_alpha * 1e6));
+	}
 }
 
 /*********************

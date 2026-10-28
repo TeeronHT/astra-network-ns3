@@ -56,6 +56,23 @@ public:
 	void AddQueuePair(uint32_t src, uint32_t dest, uint64_t tag, uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, Callback<void> notifyAppFinish, Callback<void> notifyAppSent); // add a new qp (new send)
 	void DeleteQueuePair(Ptr<RdmaQueuePair> qp);
 
+	/*
+	 * Persistent connections (TRANSPORT_CONNECTION_MODE PERSISTENT).
+	 * A persistent QP is created once per connection with an empty sequence
+	 * space, carries many logical messages posted with PostMessage, keeps its
+	 * congestion-control state and timers between messages, and is removed
+	 * only by DestroyPersistentQp. The legacy AddQueuePair/QpComplete path is
+	 * not used for these QPs.
+	 */
+	Ptr<RdmaQueuePair> CreatePersistentQp(uint32_t src, uint32_t dest, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt, uint64_t conn_id, Callback<void, Ptr<RdmaQueuePair>, RdmaWorkRequest> notifyMsgComplete);
+	RdmaWorkRequest PostMessage(Ptr<RdmaQueuePair> qp, uint64_t msg_id, uint64_t bytes);
+	void CompleteWorkRequests(Ptr<RdmaQueuePair> qp); // invoke completions for acknowledged work
+	void DestroyPersistentQp(Ptr<RdmaQueuePair> qp);
+	static uint64_t s_next_qp_id; // backend-wide QP id source (both modes)
+private:
+	void InitQpState(Ptr<RdmaQueuePair> qp, uint32_t nic_idx); // line-rate initialisation shared by both modes
+public:
+
 	Ptr<RdmaRxQueuePair> GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, uint16_t pg, bool create); // get a rxQp
 	uint32_t GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q); // get the NIC index of the rxQp
 	void DeleteRxQp(uint32_t dip, uint16_t pg, uint16_t dport);

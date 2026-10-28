@@ -11,6 +11,7 @@
 #include "ppp-header.h"
 #include "ns3/simulator.h"
 #include "ns3/int-header.h"
+#include "rdma-cc-trace.h"
 #include <cmath>
 
 namespace ns3 {
@@ -24,6 +25,11 @@ TypeId SwitchNode::GetTypeId (void)
 			"Enable ECN marking.",
 			BooleanValue(false),
 			MakeBooleanAccessor(&SwitchNode::m_ecnEnabled),
+			MakeBooleanChecker())
+	.AddAttribute("PfcEnabled",
+			"Generate PFC PAUSE/RESUME frames.",
+			BooleanValue(true),
+			MakeBooleanAccessor(&SwitchNode::m_pfcEnabled),
 			MakeBooleanChecker())
 	.AddAttribute("CcMode",
 			"CC mode.",
@@ -58,6 +64,24 @@ SwitchNode::SwitchNode(){
 		m_lastPktSize[i] = m_lastPktTs[i] = 0;
 	for (uint32_t i = 0; i < pCnt; i++)
 		m_u[i] = 0;
+	for (uint32_t i = 0; i < pCnt; i++)
+		m_ecnMarks[i] = m_mmuDrops[i] = m_pfcPauseTx[i] = m_pfcResumeTx[i] = 0;
+}
+
+int SwitchNode::LookupDataNextHop(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) const{
+	auto entry = m_rtTable.find(dip);
+	if (entry == m_rtTable.end())
+		return -1;
+	const auto &nexthops = entry->second;
+	union {
+		uint8_t u8[4+4+2+2];
+		uint32_t u32[3];
+	} buf;
+	buf.u32[0] = sip;
+	buf.u32[1] = dip;
+	buf.u32[2] = sport | ((uint32_t)dport << 16); // same layout as the UDP branch of GetOutDev
+	uint32_t idx = EcmpHash(buf.u8, 12, m_ecmpSeed) % nexthops.size();
+	return nexthops[idx];
 }
 
 int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
@@ -90,17 +114,25 @@ int SwitchNode::GetOutDev(Ptr<const Packet> p, CustomHeader &ch){
 }
 
 void SwitchNode::CheckAndSendPfc(uint32_t inDev, uint32_t qIndex){
+	if (!m_pfcEnabled)
+		return;
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
 	if (m_mmu->CheckShouldPause(inDev, qIndex)){
 		device->SendPfc(qIndex, 0);
 		m_mmu->SetPause(inDev, qIndex);
+		m_pfcPauseTx[inDev]++;
+		RdmaCounters::pfc_pause_frames++;
 	}
 }
 void SwitchNode::CheckAndSendResume(uint32_t inDev, uint32_t qIndex){
+	if (!m_pfcEnabled)
+		return;
 	Ptr<QbbNetDevice> device = DynamicCast<QbbNetDevice>(m_devices[inDev]);
 	if (m_mmu->CheckShouldResume(inDev, qIndex)){
 		device->SendPfc(qIndex, 1);
 		m_mmu->SetResume(inDev, qIndex);
+		m_pfcResumeTx[inDev]++;
+		RdmaCounters::pfc_resume_frames++;
 	}
 }
 
@@ -126,6 +158,8 @@ void SwitchNode::SendToDev(Ptr<Packet>p, CustomHeader &ch){
 				m_mmu->UpdateIngressAdmission(inDev, qIndex, p->GetSize());
 				m_mmu->UpdateEgressAdmission(idx, qIndex, p->GetSize());
 			}else{
+				m_mmuDrops[inDev]++;
+				RdmaCounters::mmu_drops++;
 				return; // Drop
 			}
 			CheckAndSendPfc(inDev, qIndex);
@@ -213,6 +247,8 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
 				h.SetEcn((Ipv4Header::EcnType)0x03);
 				p->AddHeader(h);
 				p->AddHeader(ppp);
+				m_ecnMarks[ifIndex]++;
+				RdmaCounters::ecn_marks++;
 			}
 		}
 		//CheckAndSendPfc(inDev, qIndex);

@@ -28,10 +28,25 @@ class SwitchNode : public Node{
 
 protected:
 	bool m_ecnEnabled;
+	bool m_pfcEnabled; // generate PAUSE/RESUME frames (default true; ENABLE_PFC 0 clears it)
 	uint32_t m_ccMode;
 	uint64_t m_maxRtt;
 
 	uint32_t m_ackHighPrio; // set high priority for ACK/NACK
+
+public:
+	// observational counters (never read by the forwarding or marking logic)
+	uint64_t m_ecnMarks[pCnt];   // packets marked CE per egress port
+	uint64_t m_mmuDrops[pCnt];   // ingress-admission drops per ingress port
+	uint64_t m_pfcPauseTx[pCnt]; // PAUSE frames generated per ingress port
+	uint64_t m_pfcResumeTx[pCnt];
+
+	// Return the egress interface this switch would choose for a UDP data
+	// packet with the given 4-tuple, using exactly the ECMP hash of
+	// GetOutDev. -1 when the destination has no entry. Does not touch state.
+	int LookupDataNextHop(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) const;
+	uint32_t GetEcmpSeed() const { return m_ecmpSeed; }
+	uint64_t GetTxBytes(uint32_t port) const { return port < pCnt ? m_txBytes[port] : 0; }
 
 private:
 	int GetOutDev(Ptr<const Packet>, CustomHeader &ch);

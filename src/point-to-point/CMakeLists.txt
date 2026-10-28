@@ -32,6 +32,7 @@ build_lib(
     model/qbb-header.cc
     model/qbb-net-device.cc
     model/qbb-remote-channel.cc
+    model/rdma-cc-trace.cc
     model/rdma-driver.cc
     model/rdma-hw.cc
     model/rdma-queue-pair.cc
@@ -53,6 +54,7 @@ build_lib(
     model/qbb-header.h
     model/qbb-net-device.h
     model/qbb-remote-channel.h
+    model/rdma-cc-trace.h
     model/rdma-driver.h
     model/rdma-hw.h
     model/rdma-queue-pair.h

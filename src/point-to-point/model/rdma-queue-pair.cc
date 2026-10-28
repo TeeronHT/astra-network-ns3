@@ -70,10 +70,42 @@ RdmaQueuePair::RdmaQueuePair(uint16_t pg, Ipv4Address _sip, Ipv4Address _dip, ui
 
 	hpccPint.m_lastUpdateSeq = 0;
 	hpccPint.m_incStage = 0;
+
+	m_persistent = false;
+	m_qp_id = 0;
+	m_conn_id = 0;
+	m_createTime = startTime;
+	m_messages_posted = 0;
+	m_messages_completed = 0;
+	m_cnp_count = 0;
 }
 
 void RdmaQueuePair::SetSize(uint64_t size){
 	m_size = size;
+}
+
+RdmaWorkRequest RdmaQueuePair::PostWork(uint64_t msg_id, uint64_t bytes){
+	RdmaWorkRequest wr;
+	wr.msg_id = msg_id;
+	wr.begin = m_size;
+	wr.end = m_size + bytes;
+	wr.postTime = Simulator::Now();
+	m_size = wr.end;
+	m_wrs.push_back(wr);
+	m_messages_posted++;
+	return wr;
+}
+
+uint64_t RdmaQueuePair::NextWrBoundary(uint64_t offset){
+	for (auto &wr : m_wrs){
+		if (offset < wr.end)
+			return wr.end;
+	}
+	return m_size;
+}
+
+bool RdmaQueuePair::HasPendingWork(){
+	return !m_wrs.empty();
 }
 
 void RdmaQueuePair::SetSrc(uint32_t src){

@@ -32,10 +32,14 @@
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
 #include <ns3/rdma.h>
+#include <ns3/rdma-cc-trace.h>
 #include <ns3/sim-setting.h>
 #include <ns3/switch-node.h>
 #include <time.h>
+#include <map>
+#include <sstream>
 #include <unordered_map>
+#include <vector>
 
 using namespace ns3;
 using namespace std;
@@ -87,6 +91,54 @@ string qlen_mon_file;
 
 unordered_map<uint64_t, uint32_t> rate2kmax, rate2kmin;
 unordered_map<uint64_t, double> rate2pmax;
+
+/************************************************
+ * Research extensions. Every default below reproduces the behaviour of the
+ * backend before these keys existed. See
+ * cca-ccl-study/docs/network-backend-extensions.md.
+ ***********************************************/
+// TRANSPORT_CONNECTION_MODE LEGACY|PERSISTENT
+//   LEGACY: one sim_send -> one source port -> one QP -> fresh CC state.
+//   PERSISTENT: one QP per (src, dst, priority, channel), reused for every
+//   logical message; CC state and timers survive between messages.
+std::string transport_connection_mode = "LEGACY";
+// ENABLE_PFC 0|1. 0 stops switches from generating PAUSE frames, makes NICs
+// and switches ignore received PAUSE frames, and sets headroom to 0.
+uint32_t enable_pfc = 1;
+// PFC_THRESHOLD_VALIDATION LEGACY|STRICT. STRICT aborts when the summed
+// headroom and reserve of a switch reach its buffer (the subtraction in
+// SwitchMmu::GetPfcThreshold is unsigned and would wrap). LEGACY only warns.
+std::string pfc_threshold_validation = "LEGACY";
+// QUEUE_LOG_MIN_BYTES: ports below this occupancy are left out of qlen.txt.
+uint32_t queue_log_min_bytes = 1000;
+// SWITCH_BUFFER_MAP_FILE: optional "node_id buffer_MiB" lines overriding
+// BUFFER_SIZE for the listed switches only.
+std::string switch_buffer_map_file;
+std::map<uint32_t, uint32_t> switch_buffer_overrides;
+// ENABLE_CCA_TRACE 0|1|2 and CCA_TRACE_FILE (see rdma-cc-trace.h).
+uint32_t enable_cca_trace = 0;
+std::string cca_trace_file = "cca_trace.csv";
+// ENABLE_FLOW_METADATA_TRACE 0|1 and FLOW_TRACE_FILE: one CSV row per
+// logical message (written by the frontend).
+uint32_t enable_flow_metadata_trace = 0;
+std::string flow_trace_file = "flows.csv";
+// ENABLE_PATH_TRACE 0|1: record the ECMP path of every connection/flow in
+// the flow trace and in PATH_TRACE_FILE.
+uint32_t enable_path_trace = 0;
+std::string path_trace_file = "paths.csv";
+// TRACE_LEVEL 0|1|2. 2 keeps the packet trace (mix.tr, subject to
+// ENABLE_TRACE) and the queue monitor. 1 drops the packet trace. 0 drops
+// both. Counters, fct.txt, pfc.txt and the optional traces above are not
+// affected.
+uint32_t trace_level = 2;
+// COUNTERS_OUTPUT_FILE: backend counters written at exit (empty = stdout only).
+std::string counters_output_file;
+// STATE_SNAPSHOT_TIMES n t1 ... tn (ns) and SNAPSHOT_OUTPUT_FILE.
+std::vector<uint64_t> state_snapshot_times;
+std::string snapshot_output_file = "snapshots.txt";
+// LINK_REPORT_FILE: per-link, per-port and per-pair BDP/headroom/buffer
+// values as the backend computed them (empty = not written).
+std::string link_report_file;
 
 /************************************************
  * Runtime varibles
@@ -173,7 +225,7 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
         //	vector<uint32_t> v;
         //	queue_result[i][j] = v;
         // }
-        if (size >= 1000) {
+        if (size >= queue_log_min_bytes) {
           queue_result[i][j] = size; // .push_back(size);
           if (test == 0) {
             test = 1;
@@ -205,6 +257,99 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
   fflush(qlen_output);
   Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer,
                       qlen_output, n);
+}
+
+// Backend counters as "key=value" tokens on one line.
+void write_counters_line(FILE *out, const char *prefix) {
+  uint64_t active_qps = 0, pending_msgs = 0;
+  for (uint32_t i = 0; i < n.GetN(); i++) {
+    if (n.Get(i)->GetNodeType() != 0)
+      continue;
+    Ptr<RdmaDriver> rdma = n.Get(i)->GetObject<RdmaDriver>();
+    if (!rdma || !rdma->m_rdma)
+      continue;
+    active_qps += rdma->m_rdma->m_qpMap.size();
+    for (auto &kv : rdma->m_rdma->m_qpMap)
+      pending_msgs += kv.second->m_persistent ? kv.second->m_wrs.size()
+                                              : (kv.second->IsFinished() ? 0 : 1);
+  }
+  fprintf(out,
+          "%s time_ns=%lu ecn_marks=%lu cnp_acks=%lu mmu_drops=%lu pfc_pause_frames=%lu "
+          "pfc_resume_frames=%lu qps_created=%lu qps_destroyed=%lu active_qps=%lu "
+          "messages_posted=%lu messages_completed=%lu messages_pending=%lu\n",
+          prefix, (unsigned long)Simulator::Now().GetTimeStep(),
+          (unsigned long)RdmaCounters::ecn_marks, (unsigned long)RdmaCounters::cnp_acks,
+          (unsigned long)RdmaCounters::mmu_drops,
+          (unsigned long)RdmaCounters::pfc_pause_frames,
+          (unsigned long)RdmaCounters::pfc_resume_frames,
+          (unsigned long)RdmaCounters::qps_created,
+          (unsigned long)RdmaCounters::qps_destroyed, (unsigned long)active_qps,
+          (unsigned long)RdmaCounters::messages_posted,
+          (unsigned long)RdmaCounters::messages_completed, (unsigned long)pending_msgs);
+}
+
+// STATE_SNAPSHOT_TIMES: dump every live QP's controller state, every switch
+// port's occupancy and pause state, and the cumulative counters. Appends to
+// SNAPSHOT_OUTPUT_FILE. Observational only.
+void write_state_snapshot(uint64_t requested_ns) {
+  static FILE *out = NULL;
+  if (!out) {
+    out = fopen(snapshot_output_file.c_str(), "w");
+    if (!out)
+      return;
+  }
+  fprintf(out, "snapshot requested_ns=%lu time_ns=%lu\n", (unsigned long)requested_ns,
+          (unsigned long)Simulator::Now().GetTimeStep());
+  write_counters_line(out, "counters");
+  for (uint32_t i = 0; i < n.GetN(); i++) {
+    if (n.Get(i)->GetNodeType() != 0)
+      continue;
+    Ptr<RdmaDriver> rdma = n.Get(i)->GetObject<RdmaDriver>();
+    if (!rdma || !rdma->m_rdma)
+      continue;
+    for (auto &kv : rdma->m_rdma->m_qpMap) {
+      Ptr<RdmaQueuePair> qp = kv.second;
+      uint64_t window = cc_mode == 3 ? qp->HpGetCurWin() : qp->GetWin();
+      fprintf(out,
+              "qp node=%u conn_id=%lu qp_id=%lu src=%u dst=%u sport=%u dport=%u persistent=%d "
+              "rate_bps=%lu target_rate_bps=%lu alpha=%.9f hp_cur_rate_bps=%lu "
+              "window_bytes=%lu bytes_left=%lu snd_nxt=%lu snd_una=%lu pending_msgs=%lu "
+              "msgs_posted=%lu msgs_completed=%lu cnp_count=%lu rp_stage=%u "
+              "first_cnp_pending=%d\n",
+              i, (unsigned long)qp->m_conn_id, (unsigned long)qp->m_qp_id, qp->m_src,
+              qp->m_dest, qp->sport, qp->dport, qp->m_persistent ? 1 : 0,
+              (unsigned long)qp->m_rate.GetBitRate(),
+              (unsigned long)qp->mlx.m_targetRate.GetBitRate(), qp->mlx.m_alpha,
+              (unsigned long)qp->hp.m_curRate.GetBitRate(), (unsigned long)window,
+              (unsigned long)qp->GetBytesLeft(), (unsigned long)qp->snd_nxt,
+              (unsigned long)qp->snd_una, (unsigned long)qp->m_wrs.size(),
+              (unsigned long)qp->m_messages_posted, (unsigned long)qp->m_messages_completed,
+              (unsigned long)qp->m_cnp_count, qp->mlx.m_rpTimeStage,
+              qp->mlx.m_first_cnp ? 1 : 0);
+    }
+  }
+  for (uint32_t i = 0; i < n.GetN(); i++) {
+    if (n.Get(i)->GetNodeType() != 1)
+      continue;
+    Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
+    for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
+      uint64_t bytes = 0;
+      uint32_t paused_mask = 0;
+      for (uint32_t k = 0; k < SwitchMmu::qCnt; k++) {
+        bytes += sw->m_mmu->egress_bytes[j][k];
+        if (sw->m_mmu->paused[j][k])
+          paused_mask |= (1u << k);
+      }
+      fprintf(out,
+              "port node=%u ifindex=%u egress_bytes=%lu ingress_paused_mask=%u "
+              "tx_bytes=%lu ecn_marks=%lu mmu_drops=%lu pfc_pause_tx=%lu\n",
+              i, j, (unsigned long)bytes, paused_mask, (unsigned long)sw->GetTxBytes(j),
+              (unsigned long)sw->m_ecnMarks[j], (unsigned long)sw->m_mmuDrops[j],
+              (unsigned long)sw->m_pfcPauseTx[j]);
+    }
+  }
+  fprintf(out, "end\n");
+  fflush(out);
 }
 
 void CalculateRoute(Ptr<Node> host) {
@@ -502,6 +647,9 @@ bool ReadConf(string network_configuration) {
       conf >> qlen_mon_start;
     } else if (key.compare("QLEN_MON_END") == 0) {
       conf >> qlen_mon_end;
+    } else if (key.compare("QLEN_MON_INTERVAL") == 0) {
+      // sampling period of monitor_buffer in ns (default 100, as before)
+      conf >> qlen_mon_interval;
     } else if (key.compare("MULTI_RATE") == 0) {
       int v;
       conf >> v;
@@ -519,10 +667,90 @@ bool ReadConf(string network_configuration) {
       conf >> v;
       headroom_factor = v;
       std::cout << "headroom factor set to: " << headroom_factor << std::endl;
+    } else if (key == "TRANSPORT_CONNECTION_MODE") {
+      conf >> transport_connection_mode;
+      if (transport_connection_mode != "LEGACY" &&
+          transport_connection_mode != "PERSISTENT") {
+        std::cerr << "TRANSPORT_CONNECTION_MODE must be LEGACY or PERSISTENT, got "
+                  << transport_connection_mode << std::endl;
+        return false;
+      }
+    } else if (key == "ENABLE_PFC") {
+      conf >> enable_pfc;
+    } else if (key == "PFC_THRESHOLD_VALIDATION") {
+      conf >> pfc_threshold_validation;
+      if (pfc_threshold_validation != "LEGACY" &&
+          pfc_threshold_validation != "STRICT") {
+        std::cerr << "PFC_THRESHOLD_VALIDATION must be LEGACY or STRICT, got "
+                  << pfc_threshold_validation << std::endl;
+        return false;
+      }
+    } else if (key == "QUEUE_LOG_MIN_BYTES") {
+      conf >> queue_log_min_bytes;
+    } else if (key == "SWITCH_BUFFER_MAP_FILE") {
+      conf >> switch_buffer_map_file;
+    } else if (key == "ENABLE_CCA_TRACE") {
+      conf >> enable_cca_trace;
+    } else if (key == "CCA_TRACE_FILE") {
+      conf >> cca_trace_file;
+    } else if (key == "ENABLE_FLOW_METADATA_TRACE") {
+      conf >> enable_flow_metadata_trace;
+    } else if (key == "FLOW_TRACE_FILE") {
+      conf >> flow_trace_file;
+    } else if (key == "ENABLE_PATH_TRACE") {
+      conf >> enable_path_trace;
+    } else if (key == "PATH_TRACE_FILE") {
+      conf >> path_trace_file;
+    } else if (key == "TRACE_LEVEL") {
+      conf >> trace_level;
+    } else if (key == "COUNTERS_OUTPUT_FILE") {
+      conf >> counters_output_file;
+    } else if (key == "STATE_SNAPSHOT_TIMES") {
+      int n_t;
+      conf >> n_t;
+      for (int i = 0; i < n_t; i++) {
+        uint64_t t;
+        conf >> t;
+        state_snapshot_times.push_back(t);
+      }
+    } else if (key == "SNAPSHOT_OUTPUT_FILE") {
+      conf >> snapshot_output_file;
+    } else if (key == "LINK_REPORT_FILE") {
+      conf >> link_report_file;
     }
     fflush(stdout);
   }
   conf.close();
+  return true;
+}
+
+// SWITCH_BUFFER_MAP_FILE: "node_id buffer_MiB" per line, '#' comments.
+// Validation against the topology happens in SetupNetwork once nodes exist.
+bool ReadSwitchBufferMap() {
+  if (switch_buffer_map_file.empty())
+    return true;
+  std::ifstream f(switch_buffer_map_file.c_str());
+  if (!f.is_open()) {
+    std::cerr << "Error: cannot open SWITCH_BUFFER_MAP_FILE " << switch_buffer_map_file
+              << std::endl;
+    return false;
+  }
+  std::string line;
+  while (std::getline(f, line)) {
+    size_t hash = line.find('#');
+    if (hash != std::string::npos)
+      line = line.substr(0, hash);
+    std::istringstream iss(line);
+    long long node, mib;
+    if (!(iss >> node >> mib))
+      continue;
+    if (node < 0 || mib <= 0) {
+      std::cerr << "SWITCH_BUFFER_MAP_FILE: invalid entry '" << line
+                << "' (node >= 0 and buffer_MiB > 0 required)" << std::endl;
+      return false;
+    }
+    switch_buffer_overrides[(uint32_t)node] = (uint32_t)mib;
+  }
   return true;
 }
 
@@ -533,6 +761,17 @@ void SetConfig() {
   Config::SetDefault("ns3::QbbNetDevice::QcnEnabled", BooleanValue(enable_qcn));
   Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold",
                      BooleanValue(dynamicth));
+  if (!enable_pfc) {
+    // Devices ignore received PAUSE frames; switches stop generating them
+    // (SwitchNode::PfcEnabled, set per switch below).
+    Config::SetDefault("ns3::QbbNetDevice::QbbEnabled", BooleanValue(false));
+  }
+  // TRACE_LEVEL 0/1 remove the packet trace; 0 also removes the queue monitor.
+  if (trace_level < 2)
+    enable_trace = 0;
+  RdmaCcTrace::cc_mode = cc_mode;
+  if (enable_cca_trace > 0)
+    RdmaCcTrace::Open(cca_trace_file, (int)enable_cca_trace);
 
   // set int_multi
   IntHop::multi = int_multi;
@@ -706,11 +945,64 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
   }
 
   nic_rate = get_nic_rate(n);
+
+  // Per-switch buffer overrides: validate against the topology first.
+  if (!ReadSwitchBufferMap())
+    return false;
+  for (auto &kv : switch_buffer_overrides) {
+    if (kv.first >= node_num) {
+      std::cerr << "SWITCH_BUFFER_MAP_FILE: node " << kv.first << " does not exist ("
+                << node_num << " nodes)" << std::endl;
+      return false;
+    }
+    if (n.Get(kv.first)->GetNodeType() != 1) {
+      std::cerr << "SWITCH_BUFFER_MAP_FILE: node " << kv.first << " is not a switch"
+                << std::endl;
+      return false;
+    }
+  }
+
+  FILE *link_report = NULL;
+  if (!link_report_file.empty()) {
+    link_report = fopen(link_report_file.c_str(), "w");
+    if (link_report) {
+      fprintf(link_report, "# time_unit ns ; rate_unit bit/s ; sizes bytes\n");
+      fprintf(link_report, "config buffer_size_mib=%u headroom_factor=%d enable_pfc=%u "
+              "pfc_threshold_validation=%s transport_connection_mode=%s nic_rate_bps=%lu\n",
+              buffer_size, headroom_factor, enable_pfc, pfc_threshold_validation.c_str(),
+              transport_connection_mode.c_str(), (unsigned long)nic_rate);
+      for (auto &i : nbr2if) {
+        for (auto &j : i.second) {
+          uint64_t bdp = j.second.bw * j.second.delay / 8 / 1000000000;
+          fprintf(link_report, "link src=%u dst=%u ifindex=%u rate_bps=%lu delay_ns=%lu "
+                  "one_way_bdp_bytes=%lu\n",
+                  i.first->GetId(), j.first->GetId(), j.second.idx,
+                  (unsigned long)j.second.bw, (unsigned long)j.second.delay,
+                  (unsigned long)bdp);
+        }
+      }
+    }
+  }
+
   // config switch
+  bool pfc_config_invalid = false;
   for (uint32_t i = 0; i < node_num; i++) {
     if (n.Get(i)->GetNodeType() == 1) { // is switch
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n.Get(i));
       uint32_t shift = 3; // by default 1/8
+      if (!enable_pfc)
+        sw->SetAttribute("PfcEnabled", BooleanValue(false));
+
+      uint32_t this_buffer_mib = buffer_size;
+      auto ov = switch_buffer_overrides.find(i);
+      if (ov != switch_buffer_overrides.end())
+        this_buffer_mib = ov->second;
+      uint64_t this_buffer_bytes = (uint64_t)this_buffer_mib * 1024 * 1024;
+      if (this_buffer_bytes > 0xffffffffULL) {
+        std::cerr << "switch " << i << ": buffer " << this_buffer_mib
+                  << " MiB does not fit SwitchMmu's 32-bit byte counters" << std::endl;
+        return false;
+      }
 
       for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
         Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
@@ -729,7 +1021,17 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
                              ->GetDelay()
                              .GetTimeStep();
         // uint32_t headroom = 150000; // rate * delay / 8 / 1000000000 * 3;
-        uint32_t headroom = rate * delay / 8 / 1000000000 * headroom_factor;
+        uint64_t headroom64 = rate * delay / 8 / 1000000000 * headroom_factor;
+        if (!enable_pfc)
+          headroom64 = 0; // no PAUSE frames, so nothing lands in headroom
+        if (headroom64 > 0xffffffffULL) {
+          std::cerr << "switch " << i << " port " << j << ": headroom " << headroom64
+                    << " bytes overflows uint32 (rate " << rate << " bit/s, delay "
+                    << delay << " ns)" << std::endl;
+          if (pfc_threshold_validation == "STRICT")
+            return false;
+        }
+        uint32_t headroom = (uint32_t)headroom64;
         sw->m_mmu->ConfigHdrm(j, headroom);
 
         // set pfc alpha, proportional to link bw
@@ -738,11 +1040,61 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
           sw->m_mmu->pfc_a_shift[j]--;
           rate /= 2;
         }
+        if (link_report) {
+          uint64_t link_rate = dev->GetDataRate().GetBitRate();
+          fprintf(link_report, "port node=%u ifindex=%u rate_bps=%lu delay_ns=%lu "
+                  "headroom_bytes=%u kmin_bytes=%u kmax_bytes=%u pmax=%g pfc_a_shift=%u\n",
+                  i, j, (unsigned long)link_rate, (unsigned long)delay, headroom,
+                  rate2kmin[link_rate] * 1000, rate2kmax[link_rate] * 1000,
+                  rate2pmax[link_rate], sw->m_mmu->pfc_a_shift[j]);
+        }
       }
       sw->m_mmu->ConfigNPort(sw->GetNDevices() - 1);
-      sw->m_mmu->ConfigBufferSize(buffer_size * 1024 * 1024);
+      sw->m_mmu->ConfigBufferSize((uint32_t)this_buffer_bytes);
       sw->m_mmu->node_id = sw->GetId();
+
+      // Headroom + reserve must leave shared buffer, or
+      // SwitchMmu::GetPfcThreshold wraps its unsigned subtraction.
+      uint64_t committed = (uint64_t)sw->m_mmu->total_hdrm + sw->m_mmu->total_rsrv;
+      bool invalid = committed >= this_buffer_bytes;
+      if (link_report) {
+        fprintf(link_report, "switch node=%u buffer_bytes=%lu total_headroom_bytes=%u "
+                "total_reserve_bytes=%u shared_bytes=%ld pfc_config_valid=%d\n",
+                i, (unsigned long)this_buffer_bytes, sw->m_mmu->total_hdrm,
+                sw->m_mmu->total_rsrv,
+                (long)((int64_t)this_buffer_bytes - (int64_t)committed), invalid ? 0 : 1);
+      }
+      if (invalid) {
+        pfc_config_invalid = true;
+        std::cerr << "INVALID PFC CONFIGURATION: switch " << i << " buffer "
+                  << this_buffer_bytes << " bytes <= headroom " << sw->m_mmu->total_hdrm
+                  << " + reserve " << sw->m_mmu->total_rsrv << " bytes; the pause "
+                  << "threshold (buffer - headroom - reserve) would wrap to "
+                  << (uint32_t)((uint32_t)this_buffer_bytes - sw->m_mmu->total_hdrm -
+                                sw->m_mmu->total_rsrv)
+                  << " >> shift" << std::endl;
+        for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
+          Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(j));
+          std::cerr << "  port " << j << " rate " << dev->GetDataRate().GetBitRate()
+                    << " bit/s delay "
+                    << DynamicCast<QbbChannel>(dev->GetChannel())->GetDelay().GetTimeStep()
+                    << " ns headroom " << sw->m_mmu->headroom[j] << " bytes" << std::endl;
+        }
+      }
     }
+  }
+  if (link_report) {
+    fflush(link_report);
+  }
+  if (pfc_config_invalid) {
+    if (pfc_threshold_validation == "STRICT") {
+      std::cerr << "PFC_THRESHOLD_VALIDATION STRICT: refusing to run." << std::endl;
+      if (link_report)
+        fclose(link_report);
+      return false;
+    }
+    std::cerr << "PFC_THRESHOLD_VALIDATION LEGACY: continuing with the wrapped "
+              << "threshold, as the original backend did." << std::endl;
   }
 
 #if ENABLE_QP
@@ -829,9 +1181,20 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
         maxBdp = bdp;
       if (rtt > maxRtt)
         maxRtt = rtt;
+      if (link_report && i != j)
+        fprintf(link_report, "pair src=%u dst=%u one_way_delay_ns=%lu tx_delay_ns=%lu "
+                "rtt_ns=%lu bottleneck_bps=%lu rtt_bdp_bytes=%lu\n",
+                i, j, (unsigned long)delay, (unsigned long)txDelay, (unsigned long)rtt,
+                (unsigned long)bw, (unsigned long)bdp);
     }
   }
   printf("maxRtt=%lu maxBdp=%lu\n", maxRtt, maxBdp);
+  if (link_report) {
+    fprintf(link_report, "global max_rtt_ns=%lu max_bdp_bytes=%lu has_win=%u global_t=%u\n",
+            (unsigned long)maxRtt, (unsigned long)maxBdp, has_win, global_t);
+    fclose(link_report);
+    link_report = NULL;
+  }
 
   //
   // setup switch CC
@@ -907,8 +1270,13 @@ bool SetupNetwork(void (*qp_finish)(FILE *, Ptr<RdmaQueuePair>)) {
 
   // schedule buffer monitor
   FILE *qlen_output = fopen(qlen_mon_file.c_str(), "w");
-  Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output,
-                      &n);
+  if (trace_level >= 1)
+    Simulator::Schedule(NanoSeconds(qlen_mon_start), &monitor_buffer, qlen_output,
+                        &n);
+
+  // schedule state snapshots
+  for (uint64_t t : state_snapshot_times)
+    Simulator::Schedule(NanoSeconds(t), &write_state_snapshot, t);
 
   return true;
 }

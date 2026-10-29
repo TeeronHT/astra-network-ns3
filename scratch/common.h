@@ -208,33 +208,31 @@ struct QlenDistribution {
 };
 map<uint32_t, map<uint32_t, uint32_t>> queue_result;
 void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
+  uint64_t now = Simulator::Now().GetTimeStep();
+  // QLEN_MON_END is the last sample time. Without this check the monitor
+  // reschedules itself forever, so Simulator::Run never drains even after
+  // every rank has finished (and fflush of an empty NFS file every interval
+  // keeps the process in iowait).
+  if (now > qlen_mon_end)
+    return;
+
+  bool wrote = false;
   for (uint32_t i = 0; i < n->GetN(); i++) {
     if (n->Get(i)->GetNodeType() == 1) { // is switch
       Ptr<SwitchNode> sw = DynamicCast<SwitchNode>(n->Get(i));
       if (queue_result.find(i) == queue_result.end())
         queue_result[i];
-      // fprintf(qlen_output, "\n");
-      // fprintf(qlen_output, "time: %lu\n", Simulator::Now().GetTimeStep());
       int test = 0;
       for (uint32_t j = 1; j < sw->GetNDevices(); j++) {
         uint32_t size = 0;
         for (uint32_t k = 0; k < SwitchMmu::qCnt; k++)
           size += sw->m_mmu->egress_bytes[j][k];
-        // if (queue_result[i].find(j) == queue_result[i].end())
-        //{
-        //	vector<uint32_t> v;
-        //	queue_result[i][j] = v;
-        // }
         if (size >= queue_log_min_bytes) {
-          queue_result[i][j] = size; // .push_back(size);
+          queue_result[i][j] = size;
           if (test == 0) {
             test = 1;
-            fprintf(qlen_output, "time %lu %u ", Simulator::Now().GetTimeStep(),
-                    i);
+            fprintf(qlen_output, "time %lu %u ", now, i);
           }
-          // if(j==1){
-          // fprintf(qlen_output, "t %lu %u j %u %u ",
-          // Simulator::Now().GetTimeStep(), i, j, size);
           if (j < sw->GetNDevices() - 1) {
             test = 2;
             fprintf(qlen_output, "j %u %u ", j, size);
@@ -246,17 +244,17 @@ void monitor_buffer(FILE *qlen_output, NodeContainer *n) {
         if (j == sw->GetNDevices() - 1 && test == 2) {
           fprintf(qlen_output, "\n");
         }
-        // else
-        //	queue_result[i][j]+=size;
-        // queue_result[i][j].add(size);
       }
-      fflush(qlen_output);
-      // fprintf(qlen_output, "\n");
+      if (test != 0)
+        wrote = true;
     }
   }
-  fflush(qlen_output);
-  Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer,
-                      qlen_output, n);
+  if (wrote)
+    fflush(qlen_output);
+  uint64_t next = now + qlen_mon_interval;
+  if (next <= qlen_mon_end)
+    Simulator::Schedule(NanoSeconds(qlen_mon_interval), &monitor_buffer,
+                        qlen_output, n);
 }
 
 // Backend counters as "key=value" tokens on one line.
